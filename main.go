@@ -144,15 +144,15 @@ func (p *Plugin) MintX509CAAndSubscribe(req *upstreamauthorityv1.MintX509CAReque
 	)
 
 	// Send CSR to external CA and get signed certificate
-	certChain, rootCerts, err := p.signCSRWithExternalCA(ctx, config, req.Csr, req.PreferredTtl)
+	certChainBytes, rootCertsBytes, err := p.signCSRWithExternalCA(ctx, config, req.Csr, req.PreferredTtl)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to sign CSR with external CA: %v", err)
 	}
 
 	// Send the minted certificate back
 	resp := &upstreamauthorityv1.MintX509CAResponse{
-		X509CaChain:       certChain,
-		UpstreamX509Roots: rootCerts,
+		X509CaChain:       certChainBytes,
+		UpstreamX509Roots: rootCertsBytes,
 	}
 
 	if err := stream.Send(resp); err != nil {
