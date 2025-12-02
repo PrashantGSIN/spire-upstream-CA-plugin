@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
@@ -237,88 +241,210 @@ func (p *Plugin) signCSRWithExternalCA(ctx context.Context, config *Config, csrB
 	return certChain, rootCerts, nil
 }
 
-// callExternalCAAPI makes the actual API call to your external CA
+// callExternalCAAPI makes the actual API call to GlobalSign HVCA
 func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes []byte, ttl int32) ([][]byte, error) {
-	// TODO: Implement your CA-specific API integration here
-	// This is a placeholder that you need to customize based on your CA
-	
-	p.logger.Warn("Using placeholder CA integration - implement actual CA API calls")
+	p.logger.Info("Calling GlobalSign HVCA API to sign CSR")
 
-	// Example structure for CA API integration:
-	/*
-		import (
-			"bytes"
-			"encoding/json"
-			"io/ioutil"
-			"net/http"
-			"time"
+	// Create HTTP client with timeout
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	// Convert CSR bytes to PEM format
+	csrPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE REQUEST",
+		Bytes: csrBytes,
+	})
+
+	if csrPEM == nil {
+		return nil, fmt.Errorf("failed to encode CSR to PEM")
+	}
+
+	// Step 1: Login to get access token (if needed)
+	// Note: You may need to implement persistent token management
+	// For now, we'll use the API key directly if supported
+
+	// Step 2: Submit certificate request
+	// GlobalSign Atlas API uses /v2/certificates endpoint
+	// Prepare request body according to GlobalSign Atlas API specification
+	reqBody := map[string]interface{}{
+		"validity": map[string]interface{}{
+			"not_after": map[string]interface{}{
+				"months": ttl / (30 * 24 * 3600), // Convert seconds to approximate months
+			},
+		},
+		"public_key": string(csrPEM),
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	p.logger.Debug("Sending request to GlobalSign HVCA",
+		"url", config.CAURL,
+		"endpoint", "/v2/certificates",
+	)
+
+	// Make API request to GlobalSign HVCA /v2/certificates endpoint
+	apiEndpoint := config.CAURL + "/v2/certificates"
+	req, err := http.NewRequestWithContext(ctx, "POST", apiEndpoint, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set headers for GlobalSign Atlas API
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+config.APIKey)
+	req.Header.Set("Accept", "application/json")
+
+	// Execute request
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Check status code
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != 201 {
+		p.logger.Error("GlobalSign HVCA API returned error",
+			"status", resp.Status,
+			"status_code", resp.StatusCode,
+			"body", string(body),
 		)
-		
-		client := &http.Client{Timeout: 30 * time.Second}
-		
-		// Prepare request
-		csrPEM := pem.EncodeToMemory(&pem.Block{
-			Type:  "CERTIFICATE REQUEST",
-			Bytes: csrBytes,
-		})
-		
-		reqBody := map[string]interface{}{
-			"csr": string(csrPEM),
-			"ttl": ttl,
-		}
-		
-		jsonData, err := json.Marshal(reqBody)
-		if err != nil {
-			return nil, err
-		}
-		
-		// Make API request
-		req, err := http.NewRequestWithContext(ctx, "POST", config.CAURL+"/sign", bytes.NewBuffer(jsonData))
-		if err != nil {
-			return nil, err
-		}
-		
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+config.APIKey)
-		
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-		
-		if resp.StatusCode != http.StatusOK {
-			body, _ := ioutil.ReadAll(resp.Body)
-			return nil, fmt.Errorf("CA returned error: %s - %s", resp.Status, string(body))
-		}
-		
-		// Parse response
-		var result struct {
-			Certificate string   `json:"certificate"`
-			Chain       []string `json:"chain"`
-		}
-		
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return nil, err
-		}
-		
-		// Convert PEM to DER format (SPIRE expects DER-encoded certificates)
-		var certChain [][]byte
-		for _, certPEM := range append([]string{result.Certificate}, result.Chain...) {
-			block, _ := pem.Decode([]byte(certPEM))
-			if block != nil && block.Type == "CERTIFICATE" {
-				certChain = append(certChain, block.Bytes)
-			}
-		}
-		
-		if len(certChain) == 0 {
-			return nil, fmt.Errorf("no valid certificates in CA response")
-		}
-		
-		return certChain, nil
-	*/
+		return nil, fmt.Errorf("GlobalSign HVCA returned error: %s - %s", resp.Status, string(body))
+	}
 
-	return nil, fmt.Errorf("CA API integration not implemented - customize this method for your CA")
+	p.logger.Debug("Received response from GlobalSign HVCA",
+		"status", resp.Status,
+		"body_length", len(body),
+	)
+
+	// Parse response according to GlobalSign Atlas API format
+	var result struct {
+		Certificate string `json:"certificate"`
+		// Alternative possible field names
+		Cert      string `json:"cert"`
+		PublicKey string `json:"public_key"`
+		// Certificate ID for tracking
+		ID string `json:"id"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	// Determine which field contains the certificate
+	certPEM := result.Certificate
+	if certPEM == "" {
+		certPEM = result.Cert
+	}
+	if certPEM == "" {
+		certPEM = result.PublicKey
+	}
+
+	if certPEM == "" {
+		p.logger.Error("No certificate found in response", "response_body", string(body))
+		return nil, fmt.Errorf("no certificate found in response")
+	}
+
+	// Convert PEM certificate to DER format (SPIRE expects DER-encoded certificates)
+	var certChain [][]byte
+
+	// Parse and add the issued certificate
+	block, _ := pem.Decode([]byte(certPEM))
+	if block != nil && block.Type == "CERTIFICATE" {
+		certChain = append(certChain, block.Bytes)
+		p.logger.Debug("Added issued certificate to chain")
+	} else {
+		return nil, fmt.Errorf("invalid certificate in response")
+	}
+
+	// Get the certificate chain from GlobalSign (intermediate certificates)
+	// Use /v2/trustchain endpoint to get intermediate certificates
+	intermediates, err := p.getTrustChain(ctx, config, client)
+	if err != nil {
+		p.logger.Warn("Failed to fetch trust chain", "error", err)
+		// Continue without intermediates - some CAs include them in the cert response
+	} else {
+		certChain = append(certChain, intermediates...)
+	}
+
+	if len(certChain) == 0 {
+		return nil, fmt.Errorf("no valid certificates in CA response")
+	}
+
+	p.logger.Info("Successfully retrieved certificate from GlobalSign HVCA",
+		"chain_length", len(certChain),
+		"cert_id", result.ID,
+	)
+
+	return certChain, nil
+}
+
+// getTrustChain retrieves intermediate certificates from GlobalSign HVCA
+func (p *Plugin) getTrustChain(ctx context.Context, config *Config, client *http.Client) ([][]byte, error) {
+	apiEndpoint := config.CAURL + "/v2/trustchain"
+	
+	req, err := http.NewRequestWithContext(ctx, "GET", apiEndpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create trustchain request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+config.APIKey)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute trustchain request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read trustchain response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("trustchain request failed: %s", resp.Status)
+	}
+
+	// Parse trustchain response
+	var trustChainResp struct {
+		Certificates []string `json:"certificates"`
+		Chain        []string `json:"chain"`
+		TrustChain   []string `json:"trust_chain"`
+	}
+
+	if err := json.Unmarshal(body, &trustChainResp); err != nil {
+		return nil, fmt.Errorf("failed to parse trustchain response: %w", err)
+	}
+
+	// Try different field names
+	chains := trustChainResp.Certificates
+	if len(chains) == 0 {
+		chains = trustChainResp.Chain
+	}
+	if len(chains) == 0 {
+		chains = trustChainResp.TrustChain
+	}
+
+	var intermediates [][]byte
+	for i, certPEM := range chains {
+		block, _ := pem.Decode([]byte(certPEM))
+		if block != nil && block.Type == "CERTIFICATE" {
+			intermediates = append(intermediates, block.Bytes)
+			p.logger.Debug("Added intermediate certificate", "index", i)
+		}
+	}
+
+	return intermediates, nil
 }
 
 // fetchCARootCertificates retrieves root certificates from the CA
