@@ -543,11 +543,18 @@ func (p *Plugin) createHVClientConfig(config *Config) (*hvclient.Config, error) 
 		return nil, fmt.Errorf("failed to load client certificate: %w", err)
 	}
 
+	// Parse the X.509 certificate from the cert
+	x509Cert, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse X.509 certificate: %w", err)
+	}
+
 	hvConfig := &hvclient.Config{
 		URL:       baseURL,
 		APIKey:    config.APIKey,
 		APISecret: config.APIKey, // Use API key as secret if no separate secret
-		TLS:       &tls.Config{Certificates: []tls.Certificate{cert}},
+		TLSCert:   x509Cert,
+		TLSKey:    cert.PrivateKey,
 	}
 
 	p.logger.Info("Created GlobalSign hvclient configuration",
