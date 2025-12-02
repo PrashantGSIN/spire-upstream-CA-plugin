@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -245,9 +247,10 @@ func (p *Plugin) signCSRWithExternalCA(ctx context.Context, config *Config, csrB
 func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes []byte, ttl int32) ([][]byte, error) {
 	p.logger.Info("Calling GlobalSign HVCA API to sign CSR")
 
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second,
+	// Create HTTP client with timeout and optional mTLS
+	client, err := p.createHTTPClient(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
 	}
 
 	// Convert CSR bytes to PEM format
@@ -281,13 +284,24 @@ func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	// Determine base URL - use ca_url if set, otherwise ca_endpoint
+	baseURL := config.CAURL
+	if baseURL == "" {
+		baseURL = config.CAEndpoint
+	}
+
 	p.logger.Debug("Sending request to GlobalSign HVCA",
-		"url", config.CAURL,
+		"base_url", baseURL,
 		"endpoint", "/v2/certificates",
 	)
 
 	// Make API request to GlobalSign HVCA /v2/certificates endpoint
-	apiEndpoint := config.CAURL + "/v2/certificates"
+	// Don't add /v2 if it's already in the base URL
+	apiEndpoint := baseURL
+	if !strings.Contains(apiEndpoint, "/v2") {
+		apiEndpoint += "/v2"
+	}
+	apiEndpoint += "/certificates"
 	req, err := http.NewRequestWithContext(ctx, "POST", apiEndpoint, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -295,8 +309,14 @@ func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes
 
 	// Set headers for GlobalSign Atlas API
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+config.APIKey)
 	req.Header.Set("Accept", "application/json")
+	
+	// Add authentication - GlobalSign HVCA uses api_key in header
+	if config.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+config.APIKey)
+		// Some GlobalSign APIs may also accept api_key header
+		req.Header.Set("X-API-Key", config.APIKey)
+	}
 
 	// Execute request
 	resp, err := client.Do(req)
@@ -390,15 +410,27 @@ func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes
 
 // getTrustChain retrieves intermediate certificates from GlobalSign HVCA
 func (p *Plugin) getTrustChain(ctx context.Context, config *Config, client *http.Client) ([][]byte, error) {
-	apiEndpoint := config.CAURL + "/v2/trustchain"
+	baseURL := config.CAURL
+	if baseURL == "" {
+		baseURL = config.CAEndpoint
+	}
+	
+	apiEndpoint := baseURL
+	if !strings.Contains(apiEndpoint, "/v2") {
+		apiEndpoint += "/v2"
+	}
+	apiEndpoint += "/trustchain"
 	
 	req, err := http.NewRequestWithContext(ctx, "GET", apiEndpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create trustchain request: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+config.APIKey)
 	req.Header.Set("Accept", "application/json")
+	if config.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+config.APIKey)
+		req.Header.Set("X-API-Key", config.APIKey)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -534,4 +566,35 @@ func (p *Plugin) readCertificatesFromFile(path string) ([][]byte, error) {
 	}
 
 	return certs, nil
+}
+
+// createHTTPClient creates an HTTP client with optional mTLS configuration
+func (p *Plugin) createHTTPClient(config *Config) (*http.Client, error) {
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: config.Insecure,
+	}
+
+	// Load client certificate if provided (for mTLS)
+	if config.CertPath != "" && config.KeyPath != "" {
+		cert, err := tls.LoadX509KeyPair(config.CertPath, config.KeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load client certificate: %w", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+		p.logger.Info("Loaded client certificate for mTLS authentication",
+			"cert_path", config.CertPath,
+		)
+	}
+
+	// Create HTTP transport with TLS config
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+	}
+
+	client := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+	}
+
+	return client, nil
 }
