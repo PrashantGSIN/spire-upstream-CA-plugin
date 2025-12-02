@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -9,7 +8,6 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
-	"math/big"
 	"net/http"
 	"strings"
 	"sync"
@@ -323,6 +321,7 @@ func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes
 	} else {
 		// Add intermediate certificates to the chain
 		for i, certPEM := range trustChain {
+			// certPEM is already a string from hvclient.TrustChain()
 			block, _ := pem.Decode([]byte(certPEM))
 			if block != nil && block.Type == "CERTIFICATE" {
 				certChain = append(certChain, block.Bytes)
@@ -548,7 +547,7 @@ func (p *Plugin) createHVClientConfig(config *Config) (*hvclient.Config, error) 
 		URL:       baseURL,
 		APIKey:    config.APIKey,
 		APISecret: config.APIKey, // Use API key as secret if no separate secret
-		TLSCert:   &cert,
+		TLS:       &tls.Config{Certificates: []tls.Certificate{cert}},
 	}
 
 	p.logger.Info("Created GlobalSign hvclient configuration",
