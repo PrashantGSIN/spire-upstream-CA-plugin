@@ -281,6 +281,72 @@ type SignatureInfo struct {
 	HashAlgorithm string `json:"hash_algorithm,omitempty"`
 }
 
+// loginToHVCA performs login to HVCA and returns the access token
+func (p *Plugin) loginToHVCA(ctx context.Context, config *Config, httpClient *http.Client) (string, error) {
+	// Determine base URL
+	baseURL := config.CAURL
+	if baseURL == "" {
+		baseURL = config.CAEndpoint
+	}
+	
+	loginURL := strings.TrimSuffix(baseURL, "/") + "/login"
+	
+	// Create login request body
+	loginReq := map[string]string{
+		"api_key":    config.APIKey,
+		"api_secret": config.APISecret,
+	}
+	
+	loginJSON, err := json.Marshal(loginReq)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal login request: %w", err)
+	}
+	
+	p.logger.Debug("Logging in to HVCA", "url", loginURL)
+	
+	// Create HTTP request
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", loginURL, bytes.NewReader(loginJSON))
+	if err != nil {
+		return "", fmt.Errorf("failed to create login request: %w", err)
+	}
+	
+	httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
+	httpReq.Header.Set("Accept", "application/json")
+	
+	// Make login request
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("login request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	// Read response
+	respBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read login response: %w", err)
+	}
+	
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("login failed with status %d: %s", resp.StatusCode, string(respBody))
+	}
+	
+	// Parse response to get access token
+	var loginResp struct {
+		AccessToken string `json:"access_token"`
+	}
+	
+	if err := json.Unmarshal(respBody, &loginResp); err != nil {
+		return "", fmt.Errorf("failed to parse login response: %w", err)
+	}
+	
+	if loginResp.AccessToken == "" {
+		return "", fmt.Errorf("no access token in login response")
+	}
+	
+	p.logger.Info("Successfully logged in to HVCA")
+	return loginResp.AccessToken, nil
+}
+
 // requestCertificateWithSignature makes a direct HTTP API call to HVCA with signature field
 func (p *Plugin) requestCertificateWithSignature(ctx context.Context, config *Config, req *hvclient.Request) (*big.Int, error) {
 	// First marshal the hvclient.Request normally
@@ -332,26 +398,27 @@ func (p *Plugin) requestCertificateWithSignature(ctx context.Context, config *Co
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 
-	// Set headers - HVCA requires mTLS authentication plus API key/secret headers
+	// Set headers
 	httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
 	httpReq.Header.Set("Accept", "application/json")
-	
-	// HVCA authentication: HTTP Basic Auth (api_key:api_secret) + mTLS
-	basicAuth := base64.StdEncoding.EncodeToString([]byte(config.APIKey + ":" + config.APISecret))
-	httpReq.Header.Set("Authorization", "Basic "+basicAuth)
-	
-	p.logger.Debug("Request headers",
-		"content-type", httpReq.Header.Get("Content-Type"),
-		"auth_type", "Basic",
-		"has_api_key", config.APIKey != "",
-		"has_api_secret", config.APISecret != "",
-	)
+	// Note: Authorization header will be set after login
 
 	// Create HTTP client with mTLS
 	httpClient, err := p.createHTTPClient(config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
 	}
+	
+	// Login to get access token
+	accessToken, err := p.loginToHVCA(ctx, config, httpClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to login to HVCA: %w", err)
+	}
+	
+	// Update Authorization header with Bearer token
+	httpReq.Header.Set("Authorization", "Bearer "+accessToken)
+	
+	p.logger.Debug("Making certificate request with Bearer token")
 
 	// Make the request
 	resp, err := httpClient.Do(httpReq)
