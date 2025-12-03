@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -8,6 +9,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
+	"math/big"
 	"net/http"
 	"strings"
 	"sync"
@@ -267,6 +269,107 @@ func (p *Plugin) signCSRWithExternalCA(ctx context.Context, config *Config, csrB
 	return certChain, rootCerts, nil
 }
 
+// SignatureWrapper wraps the hvclient.Request to add signature field during JSON marshaling
+type SignatureWrapper struct {
+	*hvclient.Request
+	Signature *SignatureInfo `json:"signature,omitempty"`
+}
+
+// SignatureInfo contains signature algorithm information
+type SignatureInfo struct {
+	HashAlgorithm string `json:"hash_algorithm,omitempty"`
+}
+
+// requestCertificateWithSignature makes a direct HTTP API call to HVCA with signature field
+func (p *Plugin) requestCertificateWithSignature(ctx context.Context, config *Config, req *hvclient.Request) (*big.Int, error) {
+	// Wrap the request to include signature field
+	wrappedReq := &SignatureWrapper{
+		Request: req,
+		Signature: &SignatureInfo{
+			HashAlgorithm: "SHA-256",
+		},
+	}
+
+	// Marshal the request to JSON
+	reqJSON, err := json.Marshal(wrappedReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	p.logger.Debug("Certificate request JSON", "json", string(reqJSON))
+
+	// Determine API endpoint
+	baseURL := config.CAURL
+	if baseURL == "" {
+		baseURL = config.CAEndpoint
+	}
+	apiURL := strings.TrimSuffix(baseURL, "/") + "/v2/certificate"
+
+	// Create HTTP request
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(reqJSON))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	// Set headers
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-API-Key", config.APIKey)
+	if config.APISecret != "" {
+		httpReq.Header.Set("X-API-Secret", config.APISecret)
+	}
+
+	// Create HTTP client with mTLS
+	httpClient, err := p.createHTTPClient(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
+	}
+
+	// Make the request
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	respBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Check status code
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Extract serial number from Location or X-Certificate-Serial header
+	serialHex := resp.Header.Get("X-Certificate-Serial")
+	if serialHex == "" {
+		// Try Location header
+		location := resp.Header.Get("Location")
+		if location != "" {
+			parts := strings.Split(location, "/")
+			if len(parts) > 0 {
+				serialHex = parts[len(parts)-1]
+			}
+		}
+	}
+
+	if serialHex == "" {
+		return nil, fmt.Errorf("no serial number in response")
+	}
+
+	// Parse serial number
+	serialNum := new(big.Int)
+	serialNum, ok := serialNum.SetString(serialHex, 16)
+	if !ok {
+		return nil, fmt.Errorf("failed to parse serial number: %s", serialHex)
+	}
+
+	p.logger.Info("Certificate request successful via direct API", "serial", serialHex)
+	return serialNum, nil
+}
+
 // callExternalCAAPI makes the actual API call to GlobalSign HVCA using hvclient
 func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes []byte, ttl int32) ([][]byte, error) {
 	p.logger.Info("Calling GlobalSign HVCA API to sign CSR using hvclient")
@@ -291,8 +394,6 @@ func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes
 	}
 
 	// Create hvclient Request with the CSR and required subject DN
-	// Note: The signature hash algorithm (SHA-256) is derived from the CSR's signature
-	// or from the HVCA validation policy, similar to: hvclient -csr file.pem -sighash "SHA-256"
 	hvRequest := &hvclient.Request{
 		CSR: csr,
 		Subject: &hvclient.DN{
@@ -310,10 +411,11 @@ func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes
 		"common_name", commonName,
 		"not_after", hvRequest.Validity.NotAfter,
 		"csr_signature_algorithm", csr.SignatureAlgorithm.String(),
+		"signature_hash", "SHA-256",
 	)
 
-	// Request certificate from HVCA
-	serialNumber, err := p.hvClient.CertificateRequest(ctx, hvRequest)
+	// Make direct API call with signature field included
+	serialNumber, err := p.requestCertificateWithSignature(ctx, config, hvRequest)
 	if err != nil {
 		return nil, fmt.Errorf("failed to request certificate from HVCA: %w", err)
 	}
