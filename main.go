@@ -301,11 +301,16 @@ func (p *Plugin) callExternalCAAPI(ctx context.Context, config *Config, csrBytes
 			// Calculate NotAfter based on TTL (ttl is in seconds)
 			NotAfter: time.Now().Add(time.Duration(ttl) * time.Second),
 		},
+		Signature: &hvclient.Signature{
+			HashAlgorithm: "SHA-256",
+		},
 	}
 
 	p.logger.Debug("Submitting certificate request to GlobalSign HVCA",
 		"ttl_seconds", ttl,
+		"common_name", commonName,
 		"not_after", hvRequest.Validity.NotAfter,
+		"signature_hash", "SHA-256",
 	)
 
 	// Request certificate from HVCA
